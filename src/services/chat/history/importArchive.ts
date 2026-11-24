@@ -7,7 +7,6 @@ import { checkManifest, readSessionFile, readSessionIndex } from './schema.js'
 import { toLocalSession } from './toLocal.js'
 import {
   ArchiveError,
-  countArchiveEntries,
   isZipFile,
   readArchive,
   readEntry,
@@ -16,6 +15,8 @@ import {
 } from './zipReader.js'
 
 export type ImportProgressCallback = (processed: number, total: number) => void
+
+const fileOwner = (path: string) => /^chat_sessions\/([^/]+)_files\//.exec(path)?.[1]
 
 /** 从原件字节补充图片 MIME；无法识别时为空字符串，图片身份仍由归档的 is_image 决定。 */
 const imageType = (bytes: Uint8Array): string => {
@@ -82,7 +83,7 @@ export const checkArchiveFormat = async (file: File): Promise<void> => {
 }
 
 /**
- * 流式导入：manifest → user（不导入）→ 全部会话 JSON → index → 全部图片。
+ * 按会话读取 JSON 和对应文件，保留归档物理顺序的格式校验。
  * 也支持会话与图片交错排列、index 位于末尾的条目顺序。
  * 写入导入暂存存储；调用方负责先清空暂存，成功后替换正式数据，失败时清理暂存。
  */
@@ -94,7 +95,7 @@ export const importArchive = async (
     fail('backupUnrecognized')
   }
   const imported = new Set<string>()
-  const images = new Map<string, string>()
+  const firstImageOffset = new Map<string, number>()
   const fileSessions = new Map<string, Set<string>>()
   // 同一图片可能出现在多个会话目录，待写入的原件也参与去重。
   const stored = new Map<string, string>()
@@ -111,10 +112,13 @@ export const importArchive = async (
     if (!sessionBatch.length) {
       return
     }
+    await flushImages()
     await db.addStagingSessions(sessionBatch)
     sessionBatch = []
     sessionBatchBytes = 0
-    onProgress?.(imported.size, totalSessions)
+    if (imported.size < totalSessions) {
+      onProgress?.(imported.size, totalSessions)
+    }
   }
 
   const maxImageBatchCount = 16
@@ -130,7 +134,7 @@ export const importArchive = async (
     imageBatchBytes = 0
   }
   const saveImage = async (entry: ArchiveEntry, id: string) => {
-    if (stored.has(id)) {
+    if (entry.offset >= (firstImageOffset.get(id) ?? Infinity)) {
       await skipEntry(entry)
       return
     }
@@ -140,6 +144,7 @@ export const importArchive = async (
     const blob = await readEntry(entry, imageType)
     imageBatch.push({ id, blob })
     imageBatchBytes += blob.size
+    firstImageOffset.set(id, entry.offset)
     stored.set(id, blob.type)
     if (imageBatch.length >= maxImageBatchCount || imageBatchBytes >= maxImageBatchBytes) {
       await flushImages()
@@ -147,11 +152,20 @@ export const importArchive = async (
   }
 
   try {
-    if (onProgress) {
-      totalSessions = await countArchiveEntries(file, (path) => parseSessionPath(path) !== null)
-      onProgress(0, totalSessions)
-    }
+    const entries: ArchiveEntry[] = []
+    const filesBySession = new Map<string, ArchiveEntry[]>()
     for await (const entry of readArchive(file)) {
+      entries.push(entry)
+      const id = parseSessionPath(entry.path)
+      if (id !== null) {
+        filesBySession.set(id, [])
+      } else {
+        filesBySession.get(fileOwner(entry.path) ?? '')?.push(entry)
+      }
+    }
+    totalSessions = filesBySession.size
+    onProgress?.(0, totalSessions)
+    for (const entry of entries) {
       const { path } = entry
       const sessionId = parseSessionPath(path)
       if (!manifest) {
@@ -173,8 +187,9 @@ export const importArchive = async (
         }
         imported.add(sessionId)
         currentSessionId = sessionId
-        for (const [imagePath, id] of local.images) {
-          images.set(imagePath, id)
+        for (const fileEntry of filesBySession.get(sessionId) ?? []) {
+          const id = local.images.get(fileEntry.path)
+          await (id === undefined ? skipEntry(fileEntry) : saveImage(fileEntry, id))
         }
         for (const message of local.session.messages) {
           if (message.role !== 'user') {
@@ -202,13 +217,10 @@ export const importArchive = async (
         await flushSessions()
       } else if (
         index
-          ? imported.has(/^chat_sessions\/([^/]+)_files\//.exec(path)?.[1] ?? '')
-          : currentSessionId && path.startsWith(sessionFilesDir(currentSessionId))
+          ? !imported.has(fileOwner(path) ?? '')
+          : !currentSessionId || !path.startsWith(sessionFilesDir(currentSessionId))
       ) {
-        // 没有被引用的条目不保存，引用了但缺失的图片只展示文件名。
-        const id = images.get(path)
-        await (id === undefined ? skipEntry(entry) : saveImage(entry, id))
-      } else {
+        // 附件正文已随所属会话处理，此处仍校验归档中的位置。
         fail('backupIncomplete')
       }
     }
@@ -229,7 +241,6 @@ export const importArchive = async (
     fail('backupIncomplete')
   }
   await flushSessions()
-  await flushImages()
   const targetSessions = new Set<string>()
   for (const [id, type] of stored) {
     if (!type) {
@@ -241,5 +252,8 @@ export const importArchive = async (
   }
   if (targetSessions.size > 0) {
     await db.updateStagingFileTypes(stored, targetSessions)
+  }
+  if (totalSessions > 0) {
+    onProgress?.(imported.size, totalSessions)
   }
 }
