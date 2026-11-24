@@ -7,12 +7,15 @@ import { checkManifest, readSessionFile, readSessionIndex } from './schema.js'
 import { toLocalSession } from './toLocal.js'
 import {
   ArchiveError,
+  countArchiveEntries,
   isZipFile,
   readArchive,
   readEntry,
   skipEntry,
   type ArchiveEntry,
 } from './zipReader.js'
+
+export type ImportProgressCallback = (processed: number, total: number) => void
 
 /** 从原件字节补充图片 MIME；无法识别时为空字符串，图片身份仍由归档的 is_image 决定。 */
 const imageType = (bytes: Uint8Array): string => {
@@ -83,7 +86,10 @@ export const checkArchiveFormat = async (file: File): Promise<void> => {
  * 也支持会话与图片交错排列、index 位于末尾的条目顺序。
  * 写入导入暂存存储；调用方负责先清空暂存，成功后替换正式数据，失败时清理暂存。
  */
-export const importArchive = async (file: File): Promise<void> => {
+export const importArchive = async (
+  file: File,
+  onProgress?: ImportProgressCallback
+): Promise<void> => {
   if (!(await isZipFile(file))) {
     fail('backupUnrecognized')
   }
@@ -95,6 +101,7 @@ export const importArchive = async (file: File): Promise<void> => {
   let manifest = false
   let index: SessionIndexEntry[] | undefined
   let currentSessionId: string | undefined
+  let totalSessions = 0
 
   const maxSessionBatchCount = 32
   const maxSessionBatchBytes = 2 * 1024 * 1024
@@ -107,6 +114,7 @@ export const importArchive = async (file: File): Promise<void> => {
     await db.addStagingSessions(sessionBatch)
     sessionBatch = []
     sessionBatchBytes = 0
+    onProgress?.(imported.size, totalSessions)
   }
 
   const maxImageBatchCount = 16
@@ -139,6 +147,10 @@ export const importArchive = async (file: File): Promise<void> => {
   }
 
   try {
+    if (onProgress) {
+      totalSessions = await countArchiveEntries(file, (path) => parseSessionPath(path) !== null)
+      onProgress(0, totalSessions)
+    }
     for await (const entry of readArchive(file)) {
       const { path } = entry
       const sessionId = parseSessionPath(path)

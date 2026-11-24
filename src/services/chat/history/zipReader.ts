@@ -223,6 +223,11 @@ const readDirectory = async (file: File): Promise<Directory> => {
   return directory
 }
 
+export const countArchiveEntries = async (file: File, matches: (path: string) => boolean) => {
+  const { entries } = await readDirectory(file)
+  return entries.filter((entry) => matches(entry.path)).length
+}
+
 const checkDataDescriptor = async (file: File, entry: Entry, end: number, boundary: number) => {
   if (!(entry.flags & 8)) {
     return
